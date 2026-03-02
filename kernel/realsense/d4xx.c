@@ -198,6 +198,11 @@ enum ds5_mux_pad {
 #define DS5_I2C_RETRY_COUNT	5
 #define DS5_I2C_RETRY_DELAY_US	5000
 
+/* Streaming failure recovery: trigger HW reset after this many
+ * consecutive stream-start timeouts to break non-recovering error loops.
+ */
+#define DS5_MAX_STREAM_FAILURES_BEFORE_RESET	3
+
 /* DFU definition section */
 #define DFU_MAGIC_NUMBER "/0x01/0x02/0x03/0x04"
 #define DFU_BLOCK_SIZE 1024
@@ -475,6 +480,7 @@ struct ds5 {
 	bool metadata_enabled;
 	int aggregated;
 	int reset_gen;
+	int stream_start_failures;
 	u16 fw_version;
 	u16 fw_build;
 #ifdef CONFIG_VIDEO_D4XX_SERDES
@@ -4631,6 +4637,8 @@ static int ds5_mux_s_stream(struct v4l2_subdev *sd, int on)
 			dev_dbg(&state->client->dev,
 				"stream %d toggle ok to %d in %dms, retries %d\n",
 				stream_id, on, jiffies_to_msecs(jiffies - ts), i);
+			if (on)
+				state->stream_start_failures = 0;
 			break;
 		}
 	}
@@ -4658,6 +4666,23 @@ static int ds5_mux_s_stream(struct v4l2_subdev *sd, int on)
 #endif
 		sensor->streaming = restore_val;
 		ret = -EAGAIN;
+		if (on) {
+			state->stream_start_failures++;
+			if (state->stream_start_failures >=
+			    DS5_MAX_STREAM_FAILURES_BEFORE_RESET) {
+				dev_warn(&state->client->dev,
+					"stream %d: %d consecutive start failures, "
+					"triggering HW reset\n",
+					stream_id,
+					state->stream_start_failures);
+				state->stream_start_failures = 0;
+				ds5_hw_reset_with_recovery(state);
+				/* Let camera FW stabilize after reset before
+				 * the next restart attempt from the VI framework
+				 */
+				msleep(500);
+			}
+		}
 	}
 	else if (!on)
 	{
