@@ -2360,6 +2360,14 @@ static int ds5_set_calibration_data(struct ds5 *state,
 #define DS5_HW_RESET_STABILITY_INTERVAL_MS 200	/* between each check */
 #define DS5_HW_RESET_STABILITY_TIMEOUT_MS 3000	/* max wait for stable link */
 
+/* Lightweight stability check for natural-recovery path.
+ * FW secondary init reconfigures the serializer ~200-300ms after reset
+ * readiness.  Wait, then verify the link is still alive.
+ */
+#define DS5_HW_RESET_NATURAL_SETTLE_MS		350
+#define DS5_HW_RESET_NATURAL_STABILITY_READS	2
+#define DS5_HW_RESET_NATURAL_STABILITY_INTERVAL_MS 100
+
 /* Minimum interval between consecutive HW resets (ms).
  * Rapid back-to-back resets degrade the GMSL link because each
  * serializer re-init (Phase 1) conflicts with the camera FW's own
@@ -2891,9 +2899,50 @@ static int ds5_hw_reset_with_recovery(struct ds5 *state)
 				return ret;
 			}
 		} else {
-			dev_info(&state->client->dev,
-				"%s(): GMSL link recovered naturally (device type 0x%04x), no SERDES intervention needed\n",
-				__func__, dev_type);
+			int i;
+			u16 val;
+			bool stable = true;
+
+			/* Natural recovery: device type readable immediately
+			 * after reset, but FW secondary init reconfigures the
+			 * serializer ~200-300ms later.  Wait for that window
+			 * to pass, then verify the link is still alive.
+			 */
+			msleep(DS5_HW_RESET_NATURAL_SETTLE_MS);
+			for (i = 0; i < DS5_HW_RESET_NATURAL_STABILITY_READS; i++) {
+				ret = ds5_read_poll(state, DS5_DEVICE_TYPE, &val);
+				if (ret < 0 || !ds5_is_valid_device_type(val)) {
+					stable = false;
+					break;
+				}
+				if (i < DS5_HW_RESET_NATURAL_STABILITY_READS - 1)
+					msleep(DS5_HW_RESET_NATURAL_STABILITY_INTERVAL_MS);
+			}
+
+			if (!stable) {
+				dev_info(&state->client->dev,
+					"%s(): link unstable after natural recovery (read %d/%d failed), running SERDES recovery\n",
+					__func__, i + 1,
+					DS5_HW_RESET_NATURAL_STABILITY_READS);
+				ret = ds5_hw_reset_serdes_recovery(state, false);
+				if (ret < 0) {
+					dev_err(&state->client->dev,
+						"%s(): SERDES recovery failed: %d\n",
+						__func__, ret);
+					return ret;
+				}
+				ret = ds5_wait_device_type(state, &dev_type);
+				if (ret < 0) {
+					dev_err(&state->client->dev,
+						"%s(): device type not ready after SERDES recovery (ret=%d, val=0x%x)\n",
+						__func__, ret, dev_type);
+					return ret;
+				}
+			} else {
+				dev_info(&state->client->dev,
+					"%s(): GMSL link stable after natural recovery (device type 0x%04x)\n",
+					__func__, dev_type);
+			}
 		}
 	}
 #else
