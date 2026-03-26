@@ -1863,7 +1863,7 @@ static void ds5_invalidate_sensor(struct ds5 *state, struct ds5_sensor *sensor)
 static int ds5_configure(struct ds5 *state)
 {
 	struct ds5_sensor *sensor;
-	u16 fmt, md_fmt, vc_id;
+	u16 md_fmt, vc_id;
 #ifdef CONFIG_VIDEO_D4XX_SERDES
 	u16 data_type1, data_type2;
 	bool is_calib = 0;
@@ -1968,24 +1968,20 @@ static int ds5_configure(struct ds5 *state)
 	vc_id = (state->is_depth) ? 0 : (state->is_rgb) ? 1 : (state->is_y8) ? 2 : 3;
 #endif
 
-	fmt = sensor->streaming ? sensor->config.format->data_type : 0;
-
 	/* Determine desired data-type (special cases for depth/IR), then write
 	 * it only when it differs from cached value. This avoids overwriting a
 	 * correct DT with 0 (which caused INVALID_DT on subsequent attempts).
 	 */
-	dt_value = fmt;
-	if (state->is_depth && fmt != 0)
+	dt_value = sensor->config.format->data_type;
+	if (state->is_depth && dt_value != 0)
 		dt_value = 0x31;
-	else if (state->is_y8 && fmt != 0 &&
-		 sensor->config.format->data_type == GMSL_CSI_DT_YUV422_8)
+	else if (state->is_y8 && dt_value == GMSL_CSI_DT_YUV422_8)
 		dt_value = 0x32;
-
-	dev_dbg(&state->client->dev, "sensor %p: dt_value=0x%x, cached_dt_value=0x%x, cached_fps_value=%u, framerate=%u\n",
-			sensor, dt_value, sensor->cached_dt_value, sensor->cached_fps_value, sensor->config.framerate);
 
 	if (sensor->cached_dt_value != dt_value) {
 		ret = ds5_write(state, dt_addr, dt_value);
+		dev_info(&state->client->dev, "dt_value=0x%x, cached_dt_value=0x%x, ret=%d\n",
+					dt_value, sensor->cached_dt_value, ret);
 		if (ret < 0)
 			return ret;
 		sensor->cached_dt_value = dt_value;
@@ -1994,26 +1990,30 @@ static int ds5_configure(struct ds5 *state)
 	md_value = (vc_id << 8) | md_fmt;
 	if (sensor->cached_md_value != md_value) {
 		ret = ds5_write(state, md_addr, md_value);
+		dev_info(&state->client->dev, "md_value=0x%x, cached_md_value=0x%x, ret=%d\n",
+					md_value, sensor->cached_md_value, ret);
 		if (ret < 0)
 			return ret;
 		sensor->cached_md_value = md_value;
 	}
 
-	if (!sensor->streaming)
-		return ret;
-
 	if (override_addr != 0) {
-		if (sensor->cached_override_value != fmt) {
-			ret = ds5_write(state, override_addr, fmt);
+		dt_value = sensor->config.format->data_type;
+		if (sensor->cached_override_value != dt_value) {
+			ret = ds5_write(state, override_addr, dt_value);
+			dev_info(&state->client->dev, "override_value=0x%x, cached_override_value=0x%x, ret=%d\n",
+						dt_value, sensor->cached_override_value, ret);
 			if (ret < 0)
 				return ret;
-			sensor->cached_override_value = fmt;
+			sensor->cached_override_value = dt_value;
 		}
 	}
 
 	fps_value = sensor->config.framerate;
 	if (sensor->cached_fps_value != fps_value) {
 		ret = ds5_write(state, fps_addr, fps_value);
+		dev_info(&state->client->dev, "fps_value=0x%x, cached_fps_value=0x%x, ret=%d\n",
+					fps_value, sensor->cached_fps_value, ret);
 		if (ret < 0)
 			return ret;
 		sensor->cached_fps_value = fps_value;
@@ -2022,17 +2022,28 @@ static int ds5_configure(struct ds5 *state)
 	width_value = sensor->config.resolution->width;
 	if (sensor->cached_width_value != width_value) {
 		ret = ds5_write(state, width_addr, width_value);
+		dev_info(&state->client->dev, "width_value=0x%x, cached_width_value=0x%x, ret=%d\n",
+					width_value, sensor->cached_width_value, ret);
 		if (ret < 0)
 			return ret;
 		sensor->cached_width_value = width_value;
 	}
 
+	ret = ds5_read(state, height_addr, &height_value);
+	dev_info(&state->client->dev, "height_value=0x%x, ret=%d\n",
+				height_value, ret);
+
 	height_value = sensor->config.resolution->height;
 	if (sensor->cached_height_value != height_value) {
 		ret = ds5_write(state, height_addr, height_value);
+		dev_info(&state->client->dev, "height_value=0x%x, cached_height_value=0x%x, ret=%d\n",
+					height_value, sensor->cached_height_value, ret);
 		if (ret < 0)
 			return ret;
 		sensor->cached_height_value = height_value;
+		ret = ds5_read(state, height_addr, &height_value);
+		dev_info(&state->client->dev, "height_value=0x%x, ret=%d\n",
+					height_value, ret);
 	}
 
 	return 0;
@@ -2586,19 +2597,22 @@ static int ds5_hw_reset_serdes_recovery(struct ds5 *state, bool force_phase2)
 	 * full power_off/power_on GPIO reset destroys all deserializer
 	 * state and the link does NOT come back.
 	 */
-	mutex_lock(&serdes_lock__);
-	state->dser_ops->reset_oneshot(state->dser_dev);
-	msleep(300);
+	// mutex_lock(&serdes_lock__);
+	// state->dser_ops->reset_oneshot(state->dser_dev);
+	// msleep_range(300);
 
-	/* setup_link writes to deserializer registers via host I2C (always
-	 * reachable, no GMSL needed).  This configures the link mode so
-	 * GMSL auto-negotiation can proceed.
-	 */
-	ret = state->dser_ops->setup_link(state->dser_dev, &primary->client->dev);
-	if (ret)
-		dev_warn(&state->client->dev,
-			"%s(): deser setup_link failed: %d\n", __func__, ret);
-	mutex_unlock(&serdes_lock__);
+	// /* setup_link writes to deserializer registers via host I2C (always
+	//  * reachable, no GMSL needed).  This configures the link mode so
+	//  * GMSL auto-negotiation can proceed.
+	//  */
+	// ret = state->dser_ops->setup_link(state->dser_dev, &primary->client->dev);
+	// if (ret)
+	// 	dev_warn(&state->client->dev,
+	// 		"%s(): deser setup_link failed: %d\n", __func__, ret);
+
+	// dev_info(&state->client->dev,
+	// 	"%s(): Phase 2 - performing full deserializer reset 2\n", __func__);
+	// mutex_unlock(&serdes_lock__);
 
 	/* The GMSL link may take several seconds to fully re-establish
 	 * after reset_oneshot.  In testing, the D457 camera's serializer
@@ -2606,13 +2620,17 @@ static int ds5_hw_reset_serdes_recovery(struct ds5 *state, bool force_phase2)
 	 * before attempting serializer/deserializer control setup.
 	 */
 	for (i = 0; i < 8; i++) {
-		msleep(500);
+		msleep_range(500);
 		ret = ds5_read_poll(state, DS5_FW_VERSION, &tmp);
 		if (ret == 0) {
 			dev_info(&state->client->dev,
 				"%s(): Phase 2: I2C link up after %d ms\n",
 				__func__, (i + 1) * 500 + 300);
 			break;
+		} else {
+			dev_dbg(&state->client->dev,
+				"%s(): Phase 2: I2C read attempt %d failed (err %d)\n",
+				__func__, i + 1, ret);
 		}
 	}
 
@@ -5185,7 +5203,7 @@ retry_after_serdes_recovery:
 			if (ret < 0) {
 				dev_warn(&state->client->dev, "stream %d config failed, retry %d\n",
 					stream_id, i);
-				continue;
+				break;
 			}
 			ds5_config_done = true;
 		}
@@ -5195,12 +5213,13 @@ retry_after_serdes_recovery:
 			if (ret < 0) {
 				dev_warn(&state->client->dev, "stream %d cmd 0x%x write failed, retry %d\n",
 					stream_id, stream_cmd, i);
-				continue;
+				break;
 			}
 			ret = ds5_read(state, stream_status_base, &streaming);
 			if (ret < 0) {
 				dev_warn(&state->client->dev,
 					"stream %d status i2c read failed (%d), retry %u\n", stream_id, ret, i);
+				break;
 			}
 			continue;
 		}
@@ -5251,8 +5270,9 @@ retry_after_serdes_recovery:
 		 * delayed secondary failure after a prior HW reset.  Attempt
 		 * SerDes recovery (Phase 1: serializer re-init, Phase 2: full
 		 * deserializer reset if serializer is also unreachable) and
-		 * retry the stream start once.
+		 * retry the stream start once again.
 		 */
+retry_serdes_recovery:
 		if (on && serdes_recovery_attempts < 2 &&
 		    state->ser_dev && state->dser_dev) {
 			u16 probe_val;
@@ -5273,30 +5293,21 @@ retry_after_serdes_recovery:
 				sensor->streaming = restore_val;
 				ds5_invalidate_sensor(state, sensor);
 
-				/* 1st attempt: Phase 1 (ser re-init), escalate to
-				 *   Phase 2 (reset_oneshot + poll) if unstable.
-				 * 2nd attempt: skip Phase 1, go straight to Phase 2.
-				 *   The reset_oneshot from attempt 1 may have already
-				 *   started the link recovery — Phase 2 polling will
-				 *   detect it.
-				 */
-				if (ds5_hw_reset_serdes_recovery(state,
-						serdes_recovery_attempts > 1) == 0) {
+				if (ds5_hw_reset_serdes_recovery(state,	true) == 0) {
 					dev_info(&state->client->dev,
-						"stream %d: GMSL recovery OK, "
-						"retrying stream start\n",
-						stream_id);
+						"stream %d: GMSL recovery OK, retrying stream start\n",	stream_id);
 					ds5_config_done = false;
 					ds5_config_retries = MAX_DS5_CONFIG_RETRIES;
 					status = on ? 0 : DS5_STATUS_STREAMING;
 					goto retry_after_serdes_recovery;
 				}
-				dev_err(&state->client->dev,
-					"stream %d: GMSL recovery failed "
-					"(attempt %d/2), stream start aborted\n",
-					stream_id, serdes_recovery_attempts);
+				goto retry_serdes_recovery;
 			}
 		}
+		dev_err(&state->client->dev,
+			"stream %d: GMSL recovery failed "
+			"(attempt %d/2), stream start aborted\n",
+			stream_id, serdes_recovery_attempts);
 #endif
 
 		if (streaming == expected_streaming_state) { /* try to toggle stream back on timeout  */
