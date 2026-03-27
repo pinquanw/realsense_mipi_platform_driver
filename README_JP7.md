@@ -1,9 +1,9 @@
 # RealSense™ camera driver for GMSL* interface
 
-# D457 MIPI on NVIDIA® Jetson AGX Orin™ JetPack 7.x
+# D457 MIPI on NVIDIA® Jetson AGX Thor™ JetPack 7
 The RealSense™ MIPI platform driver enables the user to control and stream RealSense™ 3D MIPI cameras.
 The system shall include:
-* NVIDIA® Jetson™ platform Supported JetPack versions are:
+* NVIDIA® Jetson™ platform Supported JetPack versions:
     - 7.1 production release
     - 7.0 production release
 * RealSense™ De-Serialize board
@@ -24,9 +24,9 @@ The system shall include:
 - Build Tools manual page [Build Manual page](./README_tools.md)
 - Driver API manual page [Driver API page](./README_driver.md)
 
-## NVIDIA® Jetson AGX Orin™ board setup
+## NVIDIA® Jetson AGX Thor™ board setup
 
-Please follow the [instruction](https://docs.nvidia.com/sdk-manager/install-with-sdkm-jetson/index.html) to flash JetPack to the NVIDIA® Jetson AGX Orin™ with NVIDIA® SDK Manager or other methods NVIDIA provides. Make sure the board is ready to use.
+Please follow the [instruction](https://docs.nvidia.com/sdk-manager/install-with-sdkm-jetson/index.html) to flash JetPack to the NVIDIA® Jetson AGX Thor™ with NVIDIA® SDK Manager or other methods NVIDIA provides. Make sure the board is ready to use.
 
 ## Build environment prerequisites
 ```
@@ -36,16 +36,16 @@ sudo apt-get install -y build-essential bc wget flex bison curl libssl-dev xxd t
 
 These are descriptiver steps. Bash commands to be issued follow:
 1. Clone [realsense_mipi_platform_driver](https://github.com/realsenseai/realsense_mipi_platform_driver.git) repo.
-2. Checkout dev branch.
-3. The developers can set up build environment, ARM64 compiler, kernel sources and NVIDIA's Jetson git repositories by using the setup script.
+2. Checkout the `dev` branch.
+3. Set up build environment, ARM64 compiler, kernel sources and NVIDIA's Jetson git repositories by using the setup script.
 4. Apply patches for kernel drivers, nvidia-oot module and tegra devicetree.
-5. Build project
-6. Apply build results to target (Jetson).
-7. Configure target.
+5. Build the project
+6. Apply build results to the target (Jetson).
+7. Configure the target.
 
 Assuming building for 7.1. One can also build for 7.0 just replace the last parameter.
 Build version can be specified only once. It will be written to jetpack_version.txt file and used for later steps.
-You can display the current version cating the file jetpack_version. It will be show at the beginning of each script.
+You can display the current version running any script below with -h option. Effective version will be also shown while running any script.
 ```
 git clone --branch dev --single-branch https://github.com/realsenseai/realsense_mipi_platform_driver.git
 cd realsense_mipi_platform_driver
@@ -53,12 +53,12 @@ cd realsense_mipi_platform_driver
 ./apply_patches.sh
 ./build_all.sh
 ```
-Note: dev_dbg() log support will not be enabled by default. If needed, run the `./build_all.sh` script with `--dev-dbg` option like below.
+Note: dev_dbg() log support will not be enabled by default. If needed, run the `./build_all.sh` script with `--dev-dbg`
 ```
 ./build_all.sh --dev-dbg
 ```
 
-## Install kernel drivers, extra modules and device-tree to Jetson AGX Orin
+## Install kernel drivers, extra modules and device-tree to Jetson AGX Thor™
 
 Following steps required:
 
@@ -66,11 +66,9 @@ Following steps required:
 If you build locally (native build on Jetson) use the following bash commands:
 ```
 sudo cp -r ./images/7.1/rootfs/lib/modules/6.8.12-tegra /lib/modules/
-sudo cp    ./images/7.1/rootfs/boot/tegra264-camera-d4xx-*.dtbo /boot/dev/
-sudo mv -f /boot/dev/Image /boot/dev/Image.old
-sudo cp    ./images/7.1/rootfs/boot/Image /boot/dev/
+sudo cp -r ./images/7.1/rootfs/boot/dtb ./images/7.1/rootfs/boot/vmlinu?-*-tegra /boot/dev/
 ```
-In case of crossbuild on host prepare a tarball to ssh copy to Jetson target.
+In case of crossbuild on external host prepare a tarball to ssh-copy to Jetson target.
 Example user 'nvidia' on Jetson with host name 'jetson.domain'
 ```
 tar czf rootfs.tar.gz -C images/7.1/rootfs boot lib
@@ -80,25 +78,25 @@ Log in into Jetson target, extract the tarball and install extracted files:
 ```
 tar xf rootfs.tar.gz
 sudo cp -r ./lib/modules/6.8.12-tegra /lib/modules/
-sudo cp    ./boot/tegra264-camera-d4xx-overlay-Advantech.dtbo /boot/
-sudo cp    ./boot/Image /boot/dev/
+sudo cp -r ./boot/dtb ./boot/vmlinu?-*-tegra /boot/dev/
 ```
-2.	Run  $ `sudo /opt/nvidia/jetson-io/jetson-io.py`, to exit choose save & reboot:
+2.	Enable and run depmod scan for "extra" & "kernel" modules
+```
+# original file content: cat /etc/depmod.d/ubuntu.conf -- search updates ubuntu built-in
+sudo sed -i 's/search updates/search extra updates kernel/g' /etc/depmod.d/ubuntu.conf
+# update driver cache
+sudo depmod
+# create initramfs file in /boot/ for new kernel
+sudo update-initramfs -ck 6.8.12-tegra
+```
+3.	Run  $ `sudo /opt/nvidia/jetson-io/jetson-io.py`:
 	1.	Configure Jetson AGX CSI Connector
 	2.	Configure for compatible hardware
 	3.	Choose appropriate configuration:
  		i.	Jetson RealSense Camera D457
 		ii. Jetson RealSense Camera D457 dual
-    5.	Choose to save & reboot
+    5.	Save and exit
 
-3.	Enable and run depmod scan for "extra" & "kernel" modules
-```
-# enable extra & kernel modules
-# original file content: cat /etc/depmod.d/ubuntu.conf -- search updates ubuntu built-in
-sudo sed -i 's/search updates/search extra updates kernel/g' /etc/depmod.d/ubuntu.conf
-# update driver cache
-sudo depmod
-```
 4.
 Verify bootloader configuration
 ```
@@ -106,14 +104,20 @@ cat /boot/extlinux/extlinux.conf
 ----<CUT>----
 LABEL JetsonIO
     MENU LABEL Custom Header Config: <CSI Jetson RealSense Camera D457>
-    LINUX /boot/dev/Image
+    LINUX /boot/dev/vmlinux-6.8.12-tegra
+    INITRD /boot/initrd.img-6.8.12-tegra
     FDT /boot/dtb/kernel_tegra264-p4071-0000+p3834-0008-nv.dtb
-    APPEND ${cbootargs} root=PARTUUID=bbb3b34e-......
-    OVERLAYS /boot/tegra264-camera-d4xx-overlay.dtbo
+    APPEND ${cbootargs} root=...
+    OVERLAYS /boot/dev/dtb/tegra264-camera-d4xx-overlay.dtbo
 ----<CUT>----
 ```
-On Jetson target (user home folder) assuming backup step was followed:
+5.
+Reboot cycling the power or using shell command
+```
+sudo reboot
+```
 
+On Jetson target (user home folder) assuming backup step was followed:
 
 ### Verify driver loaded - on Jetson:
 - Driver API manual page [Driver API page](./README_driver.md)
@@ -156,7 +160,7 @@ nvidia@ubuntu:~$ sudo dmesg | grep pca954x
 - Configuration with jetson-io tool system fail to boot with message "couldn't find root partition"
 Verify bootloader configuration
 `/boot/extlinux/extlinux.conf`
-Sometimes configuration tool missing APPEND parameters. Duplicate `primary` section `APPEND` line to `JetsonIO` `APPEND` section, verify it's similar.
+Sometimes configuration tool skips APPEND parameters. Duplicate `primary` section `APPEND` line to `JetsonIO` `APPEND` section.
 
 Example Bad:
 ```
@@ -184,11 +188,11 @@ LABEL primary
 
 LABEL JetsonIO
     MENU LABEL Custom Header Config: <CSI Jetson RealSense Camera D457 dual>
-    LINUX /boot/dev/Image
+    LINUX /boot/dev/vmlinux-6.8.12-tegra
     FDT /boot/dtb/kernel_tegra264-p4071-0000+p3834-0008-nv.dtb
-    INITRD /boot/initrd
+    INITRD /boot/initrd.img-6.8.12-tegra
     APPEND ${cbootargs} root=PARTUUID=634b7e44-aacc-4dd9-a769-3a664b83b159 rw rootwait rootfstype=ext4 mminit_loglevel=4 console=ttyTCU0,115200 console=ttyAMA0,115200 firmware_class.path=/etc/firmware fbcon=map:0 net.ifnames=0 nospectre_bhb video=efifb:off console=tty0 nv-auto-config
-    OVERLAYS /boot/tegra264-camera-d4xx-overlay.dtbo
+    OVERLAYS /boot/dev/dtb/tegra264-camera-d4xx-overlay.dtbo
 ```
 - Configuration tool jetson-io terminates without configuration menu.
 verify that `/boot/dtb` has only one dtb file
