@@ -4246,17 +4246,28 @@ static int ds5_gmsl_serdes_setup(struct ds5 *state)
 	state->dser_ops->power_off(state->dser_dev);
 	/* For now no separate power on required for serializer device */
 	state->dser_ops->power_on(state->dser_dev);
-	/* Allow deserializer to stabilize after power cycle before I2C access.
-	 * With REGCACHE_NONE the first register write goes straight to I2C;
-	 * if the chip is still booting after XCLR deassert the write fails.
-	 */
-	msleep(5);
 
 	dev_dbg(dev, "Setup SERDES addressing and control pipeline\n");
-	/* setup serdes addressing and control pipeline */
-	err = state->dser_ops->setup_link(state->dser_dev, &state->client->dev);
+	/* setup serdes addressing and control pipeline.
+	 * Retry on transient I2C failures — the MAX9296 sits behind a
+	 * PCA9548 mux and intermittent bus errors can cause setup_link
+	 * register writes (CTRL0 0x10) to fail on some boots.
+	 */
+	{
+		int link_retry;
+
+		for (link_retry = 0; link_retry < 3; link_retry++) {
+			err = state->dser_ops->setup_link(state->dser_dev,
+							  &state->client->dev);
+			if (!err)
+				break;
+			dev_warn(dev, "deserializer link config failed (%d), retry %d/3\n",
+				 err, link_retry + 1);
+			msleep(50);
+		}
+	}
 	if (err) {
-		dev_err(dev, "gmsl deserializer link config failed\n");
+		dev_err(dev, "gmsl deserializer link config failed after retries\n");
 		goto error;
 	}
 	msleep(100);

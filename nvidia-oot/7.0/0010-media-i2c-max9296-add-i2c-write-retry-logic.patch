@@ -1,0 +1,52 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Uzi Sarel <uzi.sarel@intel.com>
+Date: Wed, 9 Apr 2026 12:00:00 +0300
+Subject: [PATCH] media: i2c: max9296: add i2c write retry logic
+
+The MAX9296 deserializer sits behind a PCA9548 I2C mux on Jetson Orin
+platforms. Intermittent I2C write failures to the CTRL0 register (0x10)
+during GMSL link setup cause the SERDES initialization to leave the
+link in a partially-configured state.
+
+Add retry logic to max9296_write_reg so that transient I2C failures
+are handled transparently. Retry up to 3 times with 10ms delay between
+attempts.
+
+---
+ drivers/media/i2c/max9296.c | 18 +++++++++++++-----
+ 1 file changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/media/i2c/max9296.c b/drivers/media/i2c/max9296.c
+index 92b483b6..a1b2c3d4 100644
+--- a/drivers/media/i2c/max9296.c
++++ b/drivers/media/i2c/max9296.c
+@@ -59,13 +59,21 @@ static int max9296_write_reg(struct device *dev,
+ {
+ 	struct max9296 *priv = dev_get_drvdata(dev);
+ 	int err;
++	int retry;
+
+-	err = regmap_write(priv->regmap, addr, val);
+-	if (err)
+-		dev_err(dev, "%s:i2c write failed, 0x%x = %x\n",
+-			__func__, addr, val);
++	for (retry = 0; retry < 3; retry++) {
++		err = regmap_write(priv->regmap, addr, val);
++		if (!err)
++			return 0;
++		if (retry < 2) {
++			dev_warn(dev, "%s:i2c write failed (0x%x = 0x%x, err %d), retry %d\n",
++				 __func__, addr, val, err, retry + 1);
++			usleep_range(10000, 11000);
++		}
++	}
+
+-	/* delay before next i2c command as required for SERDES link */
++	dev_err(dev, "%s:i2c write failed after 3 retries, 0x%x = 0x%x, err %d\n",
++		__func__, addr, val, err);
+ 	usleep_range(100, 110);
+
+ 	return err;
+--
+2.43.0
+
