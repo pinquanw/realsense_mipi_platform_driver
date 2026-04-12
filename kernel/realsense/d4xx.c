@@ -2427,26 +2427,38 @@ static int ds5_wait_device_type(struct ds5 *state, u16 *dev_type)
 
 verify_write:
 	/*
-	 * After HW reset the GMSL I2C tunnel can return stale/garbage
-	 * data on reads (no error) while writes fail with -EREMOTEIO.
-	 * Probe the write path before declaring the device ready.
+	 * After HW reset the GMSL I2C tunnel can be in a marginal state:
+	 * reads return garbage (no error), and writes work intermittently
+	 * — a few succeed then later ones fail with -EREMOTEIO (-121).
+	 * A single successful write is not enough.  Require
+	 * DS5_HW_RESET_STABILITY_READS consecutive successful writes
+	 * before declaring the link ready.
 	 */
 	write_reg = state->control_status_reg;
 	if (!write_reg)
 		write_reg = DS5_DEPTH_CONTROL_STATUS;
 
-	for (; retry < DS5_HW_RESET_MAX_RETRIES;
-	     retry++, msleep(DS5_HW_RESET_POLL_INTERVAL_MS)) {
-		ret = ds5_write_poll(state, write_reg, 0);
-		if (ret == 0)
-			return 0;
-		dev_dbg(&state->client->dev,
-			"%s(): write probe failed (%d), retry %d\n",
-			__func__, ret, retry);
+	{
+		int consec = 0;
+
+		for (; retry < DS5_HW_RESET_MAX_RETRIES;
+		     retry++, msleep(DS5_HW_RESET_POLL_INTERVAL_MS)) {
+			ret = ds5_write_poll(state, write_reg, 0);
+			if (ret == 0) {
+				if (++consec >= DS5_HW_RESET_STABILITY_READS)
+					return 0;
+			} else {
+				if (consec)
+					dev_dbg(&state->client->dev,
+						"%s(): write wobble after %d OK, retry %d (err %d)\n",
+						__func__, consec, retry, ret);
+				consec = 0;
+			}
+		}
 	}
 
 	dev_warn(&state->client->dev,
-		"%s(): device type valid (0x%04x) but write path broken (err %d)\n",
+		"%s(): device type valid (0x%04x) but write path unstable (err %d)\n",
 		__func__, *dev_type, ret);
 	return ret;
 }
