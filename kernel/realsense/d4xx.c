@@ -6646,29 +6646,47 @@ static int ds5_probe(struct i2c_client *c
 	}
 
 	if (atomic_cmpxchg(&state->ds5_dev->ds5_probe_reset_once, 0, 1) == 0) {
-		dev_info(&c->dev, "%s(): first probe instance, running HW reset recovery\n",
-			__func__);
+		u16 pre_dev_type = DS5_DEVICE_TYPE_UNKNOWN;
+		int pre_ret;
 
-		/* Initialize sensor pipe_ids to PIPE_NOT_CONFIGURED before
-		 * hw_reset_with_recovery, otherwise the kzalloc default of 0
-		 * causes a spurious release_pipe(0) in step 2.
+		/* Check if device is already operational before resetting.
+		 * If DS5_DEVICE_TYPE is valid, the firmware is already running
+		 * and a reset is unnecessary.  This avoids disrupting devices
+		 * with marginal GMSL links that cannot re-establish the link
+		 * after HW reset (see RSDSO-21324, RSDSO-21390).
 		 */
-		state->depth.sensor.pipe_id = PIPE_NOT_CONFIGURED;
-		state->ir.sensor.pipe_id = PIPE_NOT_CONFIGURED;
-		state->rgb.sensor.pipe_id = PIPE_NOT_CONFIGURED;
-		state->imu.sensor.pipe_id = PIPE_NOT_CONFIGURED;
+		pre_ret = ds5_read(state, DS5_DEVICE_TYPE, &pre_dev_type);
+		if (!pre_ret && ds5_is_valid_device_type(pre_dev_type)) {
+			dev_info(&c->dev,
+				"%s(): device already operational (type 0x%04x), skipping probe reset\n",
+				__func__, pre_dev_type);
+			WRITE_ONCE(state->ds5_dev->cached_device_type, pre_dev_type);
+		} else {
+			dev_info(&c->dev,
+				"%s(): first probe instance, device not ready (ret=%d type=0x%04x), running HW reset recovery\n",
+				__func__, pre_ret, pre_dev_type);
 
-		ret = ds5_hw_reset_with_recovery(state);
-		if (ret < 0) {
-			dev_err(&c->dev, "%s(): probe HW reset recovery failed: %d\n",
-				__func__, ret);
-			goto e_chardev;
+			/* Initialize sensor pipe_ids to PIPE_NOT_CONFIGURED before
+			 * hw_reset_with_recovery, otherwise the kzalloc default of 0
+			 * causes a spurious release_pipe(0) in step 2.
+			 */
+			state->depth.sensor.pipe_id = PIPE_NOT_CONFIGURED;
+			state->ir.sensor.pipe_id = PIPE_NOT_CONFIGURED;
+			state->rgb.sensor.pipe_id = PIPE_NOT_CONFIGURED;
+			state->imu.sensor.pipe_id = PIPE_NOT_CONFIGURED;
+
+			ret = ds5_hw_reset_with_recovery(state);
+			if (ret < 0) {
+				dev_err(&c->dev, "%s(): probe HW reset recovery failed: %d\n",
+					__func__, ret);
+				goto e_chardev;
+			}
+
+			/* Wait after HW reset before touching MAX9295 serializer registers.
+			 * This delay helps ensure the device is ready.
+			 */
+			msleep(200);
 		}
-
-		/* Wait after HW reset before touching MAX9295 serializer registers.
-		 * This delay helps ensure the device is ready.
-		 */
-		msleep(200);
 	}
 
 	/* Verify post-reset format-discovery readiness.
@@ -6718,6 +6736,8 @@ static int ds5_probe(struct i2c_client *c
 	return 0;
 
 e_chardev:
+	if (state->ds5_dev)
+		WRITE_ONCE(state->ds5_dev->cached_device_type, DS5_DEVICE_TYPE_UNKNOWN);
 	if (state->dfu_dev.ds5_class)
 		ds5_chrdev_remove(state);
 e_regulator:
