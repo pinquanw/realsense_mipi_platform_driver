@@ -2367,7 +2367,7 @@ static int ds5_set_calibration_data(struct ds5 *state,
 /* Post-reset I2C stability verification parameters used by SERDES recovery. */
 #define DS5_HW_RESET_STABILITY_READS	3	/* consecutive successful reads */
 #define DS5_HW_RESET_STABILITY_INTERVAL_MS 200	/* between each check */
-#define DS5_HW_RESET_STABILITY_TIMEOUT_MS 3000	/* max wait for stable link */
+#define DS5_HW_RESET_STABILITY_TIMEOUT_MS 5000	/* max wait for stable link */
 
 /* Minimum interval between consecutive HW resets (ms).
  * Rapid back-to-back resets degrade the GMSL link because each
@@ -2487,10 +2487,9 @@ static int ds5_hw_reset_serdes_recovery(struct ds5 *state, bool force_phase2)
 		msleep(100);
 
 		/* Verify I2C link to camera is working AND stable.
-		 * A single successful read is not enough — the D457 FW can
-		 * momentarily restore the GMSL link during its late-boot
-		 * serializer reconfiguration, only to kill it again ~100 ms
-		 * later.  Do multiple reads with delays to catch oscillation.
+		 * A single successful read is not enough — the GMSL link
+		 * can drop again while it settles after HW reset.
+		 * Do multiple reads with delays to catch oscillation.
 		 */
 		ret = ds5_read_poll(state, DS5_FW_VERSION, &tmp);
 		if (ret == 0) {
@@ -2900,9 +2899,55 @@ static int ds5_hw_reset_with_recovery(struct ds5 *state)
 				return ret;
 			}
 		} else {
+			int total_wait = 0;
+
 			dev_info(&state->client->dev,
-				"%s(): GMSL link recovered naturally (device type 0x%04x), no SERDES intervention needed\n",
+				"%s(): GMSL link up (device type 0x%04x), verifying write path\n",
 				__func__, dev_type);
+
+			/*
+			 * After HW reset the GMSL I2C tunnel may return
+			 * stale/garbage data on reads while writes fail
+			 * with -EREMOTEIO (-121).  A read-only check
+			 * cannot detect this.  Probe the write path with
+			 * a scratch register write before declaring the
+			 * link ready.
+			 */
+			while (total_wait < DS5_HW_RESET_STABILITY_TIMEOUT_MS) {
+				msleep(DS5_HW_RESET_STABILITY_INTERVAL_MS);
+				total_wait += DS5_HW_RESET_STABILITY_INTERVAL_MS;
+				ret = ds5_write(state, ready_reg, 0);
+				if (ret == 0)
+					break;
+				dev_dbg(&state->client->dev,
+					"%s(): write probe failed (%d), %d ms elapsed\n",
+					__func__, ret, total_wait);
+			}
+
+			if (ret == 0) {
+				dev_info(&state->client->dev,
+					"%s(): write path OK after %d ms\n",
+					__func__, total_wait);
+			} else {
+				dev_warn(&state->client->dev,
+					"%s(): write path still broken after %d ms (err %d), running SERDES recovery\n",
+					__func__, total_wait, ret);
+				ret = ds5_hw_reset_serdes_recovery(state, false);
+				if (ret < 0) {
+					dev_err(&state->client->dev,
+						"%s(): SERDES recovery failed: %d\n",
+						__func__, ret);
+					return ret;
+				}
+
+				ret = ds5_wait_device_type(state, &dev_type);
+				if (ret < 0) {
+					dev_err(&state->client->dev,
+						"%s(): device type not ready after write-path recovery (ret=%d, val=0x%x)\n",
+						__func__, ret, dev_type);
+					return ret;
+				}
+			}
 		}
 	}
 #else
