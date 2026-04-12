@@ -798,6 +798,13 @@ static int ds5_read_poll(struct ds5 *state, u16 reg, u16 *val)
 	return regmap_raw_read(state->regmap, reg, val, 2);
 }
 
+static int ds5_write_poll(struct ds5 *state, u16 reg, u16 val)
+{
+	u8 value[2] = { val & 0xff, val >> 8 };
+
+	return regmap_raw_write(state->regmap, reg, value, sizeof(value));
+}
+
 static int ds5_raw_read(struct ds5 *state, u16 reg, void *val, size_t val_len)
 {
 	int ret;
@@ -2430,7 +2437,7 @@ verify_write:
 
 	for (; retry < DS5_HW_RESET_MAX_RETRIES;
 	     retry++, msleep(DS5_HW_RESET_POLL_INTERVAL_MS)) {
-		ret = ds5_write(state, write_reg, 0);
+		ret = ds5_write_poll(state, write_reg, 0);
 		if (ret == 0)
 			return 0;
 		dev_dbg(&state->client->dev,
