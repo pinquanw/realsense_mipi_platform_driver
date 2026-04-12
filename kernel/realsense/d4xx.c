@@ -2397,25 +2397,51 @@ static int ds5_wait_device_type(struct ds5 *state, u16 *dev_type)
 	int retry;
 	u16 cached_type;
 	u16 probed_type = DS5_DEVICE_TYPE_UNKNOWN;
+	u16 write_reg;
 
 	for (retry = 0; retry < DS5_HW_RESET_MAX_RETRIES;
 	     retry++, msleep(DS5_HW_RESET_POLL_INTERVAL_MS)) {
 		cached_type = READ_ONCE(state->ds5_dev->cached_device_type);
 		if (ds5_is_valid_device_type(cached_type)) {
 			*dev_type = cached_type;
-			return 0;
+			goto verify_write;
 		}
 
 		ret = ds5_read_poll(state, DS5_DEVICE_TYPE, &probed_type);
 		if (!ret && ds5_is_valid_device_type(probed_type)) {
 			WRITE_ONCE(state->ds5_dev->cached_device_type, probed_type);
 			*dev_type = probed_type;
-			return 0;
+			goto verify_write;
 		}
 	}
 
 	*dev_type = probed_type;
 	return ret ? ret : -ETIMEDOUT;
+
+verify_write:
+	/*
+	 * After HW reset the GMSL I2C tunnel can return stale/garbage
+	 * data on reads (no error) while writes fail with -EREMOTEIO.
+	 * Probe the write path before declaring the device ready.
+	 */
+	write_reg = state->control_status_reg;
+	if (!write_reg)
+		write_reg = DS5_DEPTH_CONTROL_STATUS;
+
+	for (; retry < DS5_HW_RESET_MAX_RETRIES;
+	     retry++, msleep(DS5_HW_RESET_POLL_INTERVAL_MS)) {
+		ret = ds5_write(state, write_reg, 0);
+		if (ret == 0)
+			return 0;
+		dev_dbg(&state->client->dev,
+			"%s(): write probe failed (%d), retry %d\n",
+			__func__, ret, retry);
+	}
+
+	dev_warn(&state->client->dev,
+		"%s(): device type valid (0x%04x) but write path broken (err %d)\n",
+		__func__, *dev_type, ret);
+	return ret;
 }
 
 /*
@@ -2899,55 +2925,9 @@ static int ds5_hw_reset_with_recovery(struct ds5 *state)
 				return ret;
 			}
 		} else {
-			int total_wait = 0;
-
 			dev_info(&state->client->dev,
-				"%s(): GMSL link up (device type 0x%04x), verifying write path\n",
+				"%s(): GMSL link recovered naturally (device type 0x%04x)\n",
 				__func__, dev_type);
-
-			/*
-			 * After HW reset the GMSL I2C tunnel may return
-			 * stale/garbage data on reads while writes fail
-			 * with -EREMOTEIO (-121).  A read-only check
-			 * cannot detect this.  Probe the write path with
-			 * a scratch register write before declaring the
-			 * link ready.
-			 */
-			while (total_wait < DS5_HW_RESET_STABILITY_TIMEOUT_MS) {
-				msleep(DS5_HW_RESET_STABILITY_INTERVAL_MS);
-				total_wait += DS5_HW_RESET_STABILITY_INTERVAL_MS;
-				ret = ds5_write(state, ready_reg, 0);
-				if (ret == 0)
-					break;
-				dev_dbg(&state->client->dev,
-					"%s(): write probe failed (%d), %d ms elapsed\n",
-					__func__, ret, total_wait);
-			}
-
-			if (ret == 0) {
-				dev_info(&state->client->dev,
-					"%s(): write path OK after %d ms\n",
-					__func__, total_wait);
-			} else {
-				dev_warn(&state->client->dev,
-					"%s(): write path still broken after %d ms (err %d), running SERDES recovery\n",
-					__func__, total_wait, ret);
-				ret = ds5_hw_reset_serdes_recovery(state, false);
-				if (ret < 0) {
-					dev_err(&state->client->dev,
-						"%s(): SERDES recovery failed: %d\n",
-						__func__, ret);
-					return ret;
-				}
-
-				ret = ds5_wait_device_type(state, &dev_type);
-				if (ret < 0) {
-					dev_err(&state->client->dev,
-						"%s(): device type not ready after write-path recovery (ret=%d, val=0x%x)\n",
-						__func__, ret, dev_type);
-					return ret;
-				}
-			}
 		}
 	}
 #else
