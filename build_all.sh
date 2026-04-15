@@ -56,8 +56,8 @@ fi
 
 export LOCALVERSION=-tegra
 TEGRA_KERNEL_OUT="$DEVDIR/images/${JP_INPUT_VERSION}"	# ./images/5.1.6
-export INSTALL_MOD_PATH=${TEGRA_KERNEL_OUT}/rootfs/
-export INSTALL_PATH=${INSTALL_MOD_PATH}/boot/
+export INSTALL_MOD_PATH=${TEGRA_KERNEL_OUT}/rootfs
+export INSTALL_PATH=${INSTALL_MOD_PATH}/boot
 export INSTALL_DTBS_PATH=${INSTALL_PATH}/dtb/${KERNELRELEASE}
 mkdir -p ${INSTALL_DTBS_PATH}
 
@@ -86,7 +86,7 @@ if version_lt "$JETPACK_VERSION" "6.0"; then
     fi
     make -j$(nproc)
     make -j$(nproc) modules
-    make -j$(nproc) install modules_install dtbs_install
+    make -j$(nproc) install modules_install dtbs_install headers_install
     D4XX_CMD_FILE="$(find . -name '.d4xx.o.cmd' 2>/dev/null | head -1)"
 else
     cd $BUILD_SRCS

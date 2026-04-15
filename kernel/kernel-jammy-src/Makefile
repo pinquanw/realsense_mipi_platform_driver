@@ -15,8 +15,9 @@ endif
 NPROC ?= $(shell nproc)
 
 # LOCALVERSION : -tegra or -rt-tegra
-version = $(shell grep -q "CONFIG_PREEMPT_RT=y" \
+LOCALVERSION = $(shell grep -q "CONFIG_PREEMPT_RT=y" \
     ${kernel_source_dir}/arch/arm64/configs/${KERNEL_DEF_CONFIG} && echo "-rt-tegra" || echo "-tegra")
+export LOCALVERSION
 
 .PHONY : kernel install clean help
 
@@ -24,41 +25,25 @@ kernel:
 	@echo   "================================================================================"
 	@echo   "Building $(KERNEL_SRC_DIR) sources"
 	@echo   "================================================================================"
-	$(MAKE) \
-		-C $(kernel_source_dir) $(O_OPT) \
-		LOCALVERSION=$(version) \
+	$(MAKE) -C $(kernel_source_dir) $(O_OPT) \
 		$(KERNEL_DEF_CONFIG)
 
 	$(MAKE) -j $(NPROC) \
 		-C $(kernel_source_dir) $(O_OPT) \
-		LOCALVERSION=$(version) \
-		--output-sync=target Image
-
-	$(MAKE) -j $(NPROC) \
-		-C $(kernel_source_dir) $(O_OPT) \
-		LOCALVERSION=$(version) \
-		--output-sync=target dtbs
-
-	$(MAKE) -j $(NPROC) \
-		-C $(kernel_source_dir) $(O_OPT) \
-		LOCALVERSION=$(version) \
-		--output-sync=target modules
+		--output-sync=target Image dtbs modules
 
 	@echo   "================================================================================"
 	@echo   "Kernel sources compiled successfully."
 	@echo   "================================================================================"
-
 
 install:
 	@echo   "================================================================================"
 	@echo   "Installing $(KERNEL_SRC_DIR) sources"
 	@echo   "================================================================================"
 	$(MAKE) -C $(kernel_source_dir) $(O_OPT) \
-		LOCALVERSION=$(version) \
 		install
 	$(MAKE) \
 		-C $(kernel_source_dir) $(O_OPT) \
-		LOCALVERSION=$(version) \
 		INSTALL_MOD_PATH=$(INSTALL_MOD_PATH) \
 		modules_install
 	@echo   "================================================================================"
