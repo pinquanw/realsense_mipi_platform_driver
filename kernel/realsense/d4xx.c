@@ -313,6 +313,8 @@ enum ds5_mux_pad {
 #define DFU_MANIFEST_TIMEOUT_MS 180000
 
 #define DS5_START_POLL_TIME	10
+#define DS5_START_FAST_POLL_TIME	2
+#define DS5_START_FAST_POLL_RETRIES	5
 #define DS5_START_MAX_TIME	2000
 #define DS5_START_MAX_COUNT	(DS5_START_MAX_TIME / DS5_START_POLL_TIME)
 /*
@@ -641,6 +643,9 @@ struct ds5 {
 	bool d58x_pixel_mode;
 	u16 control_base;
 	u16 control_status_reg;
+	/* A HWMC_RW SET/GET pair needs to remember that its GVD response was
+	 * satisfied from the per-camera cache instead of being sent to FW. */
+	bool hwmc_rw_gvd_cached;
 #ifdef CONFIG_VIDEO_D4XX_SERDES
 	struct gmsl_link_ctx g_ctx;
 	/* GMSL link this camera is wired to. From the serializer node's
@@ -681,6 +686,12 @@ struct ds5_dev {
 	*/
 	u16 cached_device_type;
 	u16 d585_product_id;
+	/* GVD is immutable between camera resets. Keep the response shared by all
+	 * four subdevices so repeated discovery does not transfer 606 bytes over
+	 * the GMSL I2C tunnel for every stream start. Guarded by lock. */
+	u8 gvd_cache[DS5_GVD_LEN_D5XX];
+	u16 gvd_cache_len;
+	bool gvd_cache_valid;
 
 	/* Timestamp (jiffies) of last completed HW reset.
 	* Used to enforce DS5_HW_RESET_COOLDOWN_MS between consecutive resets
@@ -913,6 +924,17 @@ static inline void msleep_range(unsigned int delay_base)
 }
 #endif
 #endif
+
+/* Stream transitions normally settle within a few milliseconds. Poll closely
+ * at first, then retain the old increasing backoff for genuinely slow/error
+ * paths so a stuck FW does not continuously occupy the GMSL I2C tunnel. */
+static unsigned int ds5_stream_poll_delay(unsigned int retry)
+{
+	if (retry <= DS5_START_FAST_POLL_RETRIES)
+		return DS5_START_FAST_POLL_TIME;
+
+	return (retry - DS5_START_FAST_POLL_RETRIES) * DS5_START_POLL_TIME;
+}
 
 static int ds5_write(struct ds5 *state, u16 reg, u16 val)
 {
@@ -3208,6 +3230,9 @@ static void ds5_reset_streaming_flags(struct ds5_dev *ds5_dev)
 	ds5_dev->ir_streaming = false;
 	ds5_dev->rgb_streaming = false;
 	ds5_dev->imu_streaming = false;
+	/* A camera reset may change FW identity and invalidates the descriptor. */
+	ds5_dev->gvd_cache_valid = false;
+	ds5_dev->gvd_cache_len = 0;
 	mutex_unlock(&ds5_dev->lock);
 }
 
@@ -3595,6 +3620,8 @@ static int ds5_hw_reset_with_recovery(struct ds5 *state)
 }
 
 static int ds5_mux_s_stream(struct v4l2_subdev *sd, int on);
+static int ds5_gvd(struct ds5 *state, unsigned char *data, u32 buf_len,
+		   u16 *data_len);
 
 static int ds5_s_ctrl(struct v4l2_ctrl *ctrl)
 {
@@ -3981,10 +4008,19 @@ static int ds5_s_ctrl(struct v4l2_ctrl *ctrl)
 				break;
 			}
 
-			size = *((u8 *)ctrl->p_new.p_u8 + 1) << 8;
-			size |= *((u8 *)ctrl->p_new.p_u8 + 0);
-			ret = ds5_hwmc_send(state, size + 4, cmd);
-			ret = ds5_get_hwmc(state, cmd->Data, ctrl->dims[0], &size);
+			if (cmd->opcode == gvd.opcode) {
+				ret = ds5_gvd(state, cmd->Data,
+					      ctrl->dims[0] - sizeof(*cmd), &size);
+			} else {
+				size = *((u8 *)ctrl->p_new.p_u8 + 1) << 8;
+				size |= *((u8 *)ctrl->p_new.p_u8 + 0);
+				ret = ds5_hwmc_send(state, size + 4, cmd);
+				if (!ret)
+					ret = ds5_get_hwmc(state, cmd->Data,
+							    ctrl->dims[0], &size);
+			}
+			if (ret)
+				break;
 			if (ctrl->dims[0] < DS5_HWMC_BUFFER_SIZE) {
 				ret = -ENODATA;
 				break;
@@ -4001,12 +4037,19 @@ static int ds5_s_ctrl(struct v4l2_ctrl *ctrl)
 			u16 size = *((u8 *)ctrl->p_new.p_u8 + 1) << 8;
 			size |= *((u8 *)ctrl->p_new.p_u8 + 0);
 
+			state->hwmc_rw_gvd_cached = false;
+
 			/* Check if this is a HW reset command (opcode 0x20) */
 			if (cmd->opcode == 0x20) {
 				dev_info(&state->client->dev,
 					"%s(): HW reset detected via HWMC_RW, using recovery path\n",
 					__func__);
 				ret = ds5_hw_reset_with_recovery(state);
+			} else if (cmd->opcode == gvd.opcode) {
+				ret = ds5_gvd(state, cmd->Data,
+					      ctrl->dims[0] - sizeof(*cmd),
+					      NULL);
+				state->hwmc_rw_gvd_cached = !ret;
 			} else {
 				ret = ds5_hwmc_send(state, size + 4, cmd);
 			}
@@ -4134,7 +4177,8 @@ static int ds5_get_calibration_data(struct ds5 *state, enum table_id id,
 	return 0;
 }
 
-static int ds5_gvd(struct ds5 *state, unsigned char *data, u32 buf_len)
+static int ds5_read_gvd(struct ds5 *state, unsigned char *data, u32 buf_len,
+			u16 *data_len)
 {
 	struct hwm_cmd cmd;
 	int ret;
@@ -4167,9 +4211,50 @@ static int ds5_gvd(struct ds5 *state, unsigned char *data, u32 buf_len)
 		return -ENOBUFS;
 	}
 
-	ds5_raw_read_with_check(state, DS5_HWMC_DATA, data, length); /* Read response data */
+	ret = ds5_raw_read(state, DS5_HWMC_DATA, data, length);
+	if (ret)
+		return ret;
+
+	if (data_len)
+		*data_len = length;
 
 	return 0;
+}
+
+static int ds5_gvd(struct ds5 *state, unsigned char *data, u32 buf_len,
+		   u16 *data_len)
+{
+	struct ds5_dev *dev = state->ds5_dev;
+	int ret = 0;
+
+	if (!data)
+		return -EINVAL;
+
+	/* Keep legacy D4xx behaviour unchanged. D58x discovery repeatedly asks for
+	 * the same 606-byte descriptor through both native and HWMC_RW controls. */
+	if (!ds5_is_d58x(state))
+		return ds5_read_gvd(state, data, buf_len, data_len);
+
+	mutex_lock(&dev->lock);
+	if (!dev->gvd_cache_valid) {
+		ret = ds5_read_gvd(state, dev->gvd_cache,
+				   sizeof(dev->gvd_cache), &dev->gvd_cache_len);
+		if (!ret)
+			dev->gvd_cache_valid = true;
+	}
+
+	if (!ret) {
+		if (dev->gvd_cache_len > buf_len) {
+			ret = -ENOBUFS;
+		} else {
+			memcpy(data, dev->gvd_cache, dev->gvd_cache_len);
+			if (data_len)
+				*data_len = dev->gvd_cache_len;
+		}
+	}
+	mutex_unlock(&dev->lock);
+
+	return ret;
 }
 
 static int ds5_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
@@ -4388,7 +4473,7 @@ static int ds5_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
 		break;
 	case DS5_CAMERA_CID_GVD:
 		ret = ds5_gvd(state, ctrl->p_new.p_u8,
-				ctrl->elems * ctrl->elem_size);
+				ctrl->elems * ctrl->elem_size, NULL);
 		break;
 	case DS5_CAMERA_CID_AE_ROI_GET:
 		if (ctrl->p_new.p_u16) {
@@ -4477,9 +4562,21 @@ static int ds5_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
 			unsigned char *data = (unsigned char *)ctrl->p_new.p_u8;
 			u16 dataLen = 0;
 			u16 bufLen = ctrl->dims[0];
-			ret = ds5_get_hwmc(state, data,	bufLen, &dataLen);
+
+			if (state->hwmc_rw_gvd_cached) {
+				ret = ds5_gvd(state, data, bufLen - 4, &dataLen);
+				state->hwmc_rw_gvd_cached = false;
+			} else {
+				ret = ds5_get_hwmc(state, data, bufLen, &dataLen);
+			}
+			if (ret)
+				break;
+			if (dataLen < 4) {
+				ret = -EBADMSG;
+				break;
+			}
 			/* This is needed for librealsense, to align there code with UVC,
-		 	 * last word is length - 4 bytes header length */
+			 * last word is length - 4 bytes header length */
 			dataLen -= 4;
 			data[bufLen - 4] = (unsigned char)(dataLen & 0x00FF);
 			data[bufLen - 3] = (unsigned char)((dataLen & 0xFF00) >> 8);
@@ -5038,6 +5135,8 @@ static void ds5_init_ds5_dev(struct ds5 *state, struct ds5_dev *ds5_dev)
 	ds5_dev->serdes_setup_complete = false;
 	ds5_dev->cached_device_type = DS5_DEVICE_TYPE_UNKNOWN;
 	ds5_dev->d585_product_id = 0;
+	ds5_dev->gvd_cache_valid = false;
+	ds5_dev->gvd_cache_len = 0;
 	ds5_dev->configured_device_mode = D500_DEVICE_MODE_3C;
 	ds5_dev->active_device_mode = D500_DEVICE_MODE_3C;
 	ds5_dev->device_mode_valid = false;
@@ -6693,7 +6792,8 @@ static int ds5_mux_s_stream(struct v4l2_subdev *sd, int on)
 	/* Verify stream is in the expected state before issuing command */
 	ts = jiffies;
 	for (timeout = ts + msecs_to_jiffies(DS5_START_MAX_TIME), i = 0;
-			time_before(jiffies, timeout); i++, msleep_range(i*DS5_START_POLL_TIME))
+			time_before(jiffies, timeout);
+			i++, msleep_range(ds5_stream_poll_delay(i)))
 	{
 		ret = ds5_read(state, config_status_base, &status);
 		if ((ret >= 0) && (on == !(status & DS5_STATUS_STREAMING))) {
@@ -6776,7 +6876,8 @@ static int ds5_mux_s_stream(struct v4l2_subdev *sd, int on)
 	ts = jiffies;
 	streaming = ~expected_streaming_state; /* force initial toggle */
 	for (timeout = ts + msecs_to_jiffies(DS5_START_MAX_TIME), i = 0;
-			time_before(jiffies, timeout); i++, msleep_range(i*DS5_START_POLL_TIME))
+			time_before(jiffies, timeout);
+			i++, msleep_range(ds5_stream_poll_delay(i)))
 	{
 		if (!ds5_config_done) {
 			ret = ds5_configure(state);
@@ -8412,7 +8513,7 @@ static int ds5_probe(struct i2c_client *c
 		unsigned char *gvd_data = kzalloc(DS5_GVD_LEN_D5XX, GFP_KERNEL);
 
 		if (gvd_data) {
-			ret = ds5_gvd(state, gvd_data, DS5_GVD_LEN_D5XX);
+			ret = ds5_gvd(state, gvd_data, DS5_GVD_LEN_D5XX, NULL);
 			if (ret) {
 				dev_warn(&c->dev,
 					 "%s(): cannot cache D585 PID from GVD (%d)\n",
