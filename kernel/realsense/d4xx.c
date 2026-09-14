@@ -317,6 +317,7 @@ enum ds5_mux_pad {
 #define DS5_START_FAST_POLL_RETRIES	5
 #define DS5_START_MAX_TIME	2000
 #define DS5_START_MAX_COUNT	(DS5_START_MAX_TIME / DS5_START_POLL_TIME)
+#define DS5_HWMC_BUFFER_SIZE	1024
 /*
  * RSDEV-12089: max wall-clock to wait for an HWMC command to complete. Must cover
  * a worst-case low-fps stream re-arm (ds5_mux_s_stream, bounded by
@@ -643,9 +644,12 @@ struct ds5 {
 	bool d58x_pixel_mode;
 	u16 control_base;
 	u16 control_status_reg;
-	/* A HWMC_RW SET/GET pair needs to remember that its GVD response was
-	 * satisfied from the per-camera cache instead of being sent to FW. */
-	bool hwmc_rw_gvd_cached;
+	/* HWMC_RW is exposed as separate SET and GET ioctls. Execute the complete
+	 * FW transaction during SET and retain its response here so commands from
+	 * different subdevices cannot interleave DATA/EXEC/response phases. */
+	u8 hwmc_rw_response[DS5_HWMC_BUFFER_SIZE];
+	u16 hwmc_rw_response_len;
+	bool hwmc_rw_response_valid;
 #ifdef CONFIG_VIDEO_D4XX_SERDES
 	struct gmsl_link_ctx g_ctx;
 	/* GMSL link this camera is wired to. From the serializer node's
@@ -666,6 +670,8 @@ struct ds5 {
 
 struct ds5_dev {
 	struct mutex lock;
+	/* One HW-monitor engine is shared by every subdevice of a camera. */
+	struct mutex hwmc_lock;
 
 	/*
 	* Per-camera reset generation counter.
@@ -744,8 +750,10 @@ static void ds5_init_global_slots_once(void)
 		return;
 	}
 
-	for (i = 0; i < MAX_DS5_NUM; i++)
+	for (i = 0; i < MAX_DS5_NUM; i++) {
 		mutex_init(&ds5_inited[i].lock);
+		mutex_init(&ds5_inited[i].hwmc_lock);
+	}
 
 	for (i = 0; i < MAX_DSER_NUM; i++)
 		mutex_init(&dser_inited[i].lock);
@@ -866,6 +874,7 @@ static void ds5_init_global_slots_once(void)
 	mutex_lock(&ds5_slots_lock__);
 	if (!ds5_slots_inited) {
 		mutex_init(&ds5_inited[0].lock);
+		mutex_init(&ds5_inited[0].hwmc_lock);
 		ds5_slots_inited = true;
 	}
 	mutex_unlock(&ds5_slots_lock__);
@@ -2844,8 +2853,6 @@ static int d500_dpp_ctrl_desc(u32 ctrl_id,
 #define DS5_HWMC_STATUS_OK		0
 #define DS5_HWMC_STATUS_ERR		1
 #define DS5_HWMC_STATUS_WIP		2
-#define DS5_HWMC_BUFFER_SIZE	1024
-
 enum DS5_HWMC_ERR {
 	DS5_HWMC_ERR_SUCCESS = 0,
 	DS5_HWMC_ERR_CMD     = -1,
@@ -4037,7 +4044,8 @@ static int ds5_s_ctrl(struct v4l2_ctrl *ctrl)
 			u16 size = *((u8 *)ctrl->p_new.p_u8 + 1) << 8;
 			size |= *((u8 *)ctrl->p_new.p_u8 + 0);
 
-			state->hwmc_rw_gvd_cached = false;
+			state->hwmc_rw_response_valid = false;
+			state->hwmc_rw_response_len = 0;
 
 			/* Check if this is a HW reset command (opcode 0x20) */
 			if (cmd->opcode == 0x20) {
@@ -4045,13 +4053,28 @@ static int ds5_s_ctrl(struct v4l2_ctrl *ctrl)
 					"%s(): HW reset detected via HWMC_RW, using recovery path\n",
 					__func__);
 				ret = ds5_hw_reset_with_recovery(state);
-			} else if (cmd->opcode == gvd.opcode) {
-				ret = ds5_gvd(state, cmd->Data,
-					      ctrl->dims[0] - sizeof(*cmd),
-					      NULL);
-				state->hwmc_rw_gvd_cached = !ret;
 			} else {
-				ret = ds5_hwmc_send(state, size + 4, cmd);
+				/* The camera has a single HWMC engine although userspace can
+				 * reach it through four V4L2 subdevices. Keep the command and
+				 * response atomic across those subdevices. */
+				mutex_lock(&state->ds5_dev->hwmc_lock);
+				if (cmd->opcode == gvd.opcode) {
+					ret = ds5_gvd(state, state->hwmc_rw_response,
+						      sizeof(state->hwmc_rw_response),
+						      &state->hwmc_rw_response_len);
+				} else {
+					ret = ds5_hwmc_send(state, size + 4, cmd);
+					if (!ret)
+						ret = ds5_get_hwmc(state,
+							state->hwmc_rw_response,
+							sizeof(state->hwmc_rw_response),
+							&state->hwmc_rw_response_len);
+					/* FW command errors are returned in the first word. */
+					if (!ret && !state->hwmc_rw_response_len)
+						state->hwmc_rw_response_len = sizeof(u32);
+				}
+				state->hwmc_rw_response_valid = !ret;
+				mutex_unlock(&state->ds5_dev->hwmc_lock);
 			}
 		}
 		break;
@@ -4560,21 +4583,21 @@ static int ds5_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
 	case DS5_CAMERA_CID_HWMC_RW: 
 		if (ctrl->p_new.p_u8) {
 			unsigned char *data = (unsigned char *)ctrl->p_new.p_u8;
-			u16 dataLen = 0;
+			u16 dataLen = state->hwmc_rw_response_len;
 			u16 bufLen = ctrl->dims[0];
 
-			if (state->hwmc_rw_gvd_cached) {
-				ret = ds5_gvd(state, data, bufLen - 4, &dataLen);
-				state->hwmc_rw_gvd_cached = false;
-			} else {
-				ret = ds5_get_hwmc(state, data, bufLen, &dataLen);
-			}
-			if (ret)
+			if (!state->hwmc_rw_response_valid) {
+				ret = -ENODATA;
 				break;
-			if (dataLen < 4) {
+			}
+			if ((dataLen < 4) || (dataLen > bufLen - 4)) {
 				ret = -EBADMSG;
+				state->hwmc_rw_response_valid = false;
 				break;
 			}
+			memset(data, 0, bufLen);
+			memcpy(data, state->hwmc_rw_response, dataLen);
+			state->hwmc_rw_response_valid = false;
 			/* This is needed for librealsense, to align there code with UVC,
 			 * last word is length - 4 bytes header length */
 			dataLen -= 4;
