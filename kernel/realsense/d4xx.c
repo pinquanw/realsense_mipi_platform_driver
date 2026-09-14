@@ -313,8 +313,6 @@ enum ds5_mux_pad {
 #define DFU_MANIFEST_TIMEOUT_MS 180000
 
 #define DS5_START_POLL_TIME	10
-#define DS5_START_FAST_POLL_TIME	2
-#define DS5_START_FAST_POLL_RETRIES	5
 #define DS5_START_MAX_TIME	2000
 #define DS5_START_MAX_COUNT	(DS5_START_MAX_TIME / DS5_START_POLL_TIME)
 #define DS5_HWMC_BUFFER_SIZE	1024
@@ -934,15 +932,20 @@ static inline void msleep_range(unsigned int delay_base)
 #endif
 #endif
 
-/* Stream transitions normally settle within a few milliseconds. Poll closely
- * at first, then retain the old increasing backoff for genuinely slow/error
- * paths so a stuck FW does not continuously occupy the GMSL I2C tunnel. */
+/* Stream transitions normally settle within a few milliseconds. Poll at 1-2ms
+ * for the first attempts, then back off to 10ms and finally 20ms. The callers
+ * retain their absolute DS5_START_MAX_TIME deadline, so error paths stay bounded
+ * to the existing two-second budget without continuously occupying GMSL I2C. */
 static unsigned int ds5_stream_poll_delay(unsigned int retry)
 {
-	if (retry <= DS5_START_FAST_POLL_RETRIES)
-		return DS5_START_FAST_POLL_TIME;
+	if (retry <= 2)
+		return 1;
+	if (retry <= 5)
+		return 2;
+	if (retry <= 10)
+		return DS5_START_POLL_TIME;
 
-	return (retry - DS5_START_FAST_POLL_RETRIES) * DS5_START_POLL_TIME;
+	return 2 * DS5_START_POLL_TIME;
 }
 
 static int ds5_write(struct ds5 *state, u16 reg, u16 val)
